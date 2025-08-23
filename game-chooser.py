@@ -192,6 +192,9 @@ class GameLibraryManager:
                 return
             
             try:
+                # First, collect all executables in each directory to handle duplicates
+                directory_exes = {}
+                
                 for item in Path(path).iterdir():
                     # Skip hidden/system files and symlinks
                     if item.name.startswith('.'):
@@ -208,20 +211,41 @@ class GameLibraryManager:
                         if rel_str in self.config["exceptions"]:
                             continue
                         
-                        # Check if valid game executable
-                        if not self.is_valid_game_executable(str(item)):
-                            new_exceptions.append(rel_str)
-                            continue
-                        
-                        # Create game entry
-                        title = item.parent.name
+                        # Group by directory
+                        dir_key = str(item.parent)
+                        if dir_key not in directory_exes:
+                            directory_exes[dir_key] = []
+                        directory_exes[dir_key].append((item, rel_str))
+                
+                # Process each directory's executables
+                for dir_path, exe_list in directory_exes.items():
+                    if not exe_list:
+                        continue
+                    
+                    # Find the first valid executable
+                    main_exe = None
+                    main_rel_str = None
+                    
+                    for exe_item, exe_rel_str in exe_list:
+                        if self.is_valid_game_executable(str(exe_item)):
+                            main_exe = exe_item
+                            main_rel_str = exe_rel_str
+                            break
+                    
+                    # If no valid executable found, use the first one
+                    if main_exe is None and exe_list:
+                        main_exe, main_rel_str = exe_list[0]
+                    
+                    if main_exe:
+                        # Create game entry for main executable
+                        title = main_exe.parent.name
                         system = platform.system()
                         plat = "Windows" if system == "Windows" else "macOS"
                         
                         # Check if game already exists
                         existing = None
                         for g in found_games:
-                            if g.launch_path == rel_str:
+                            if g.launch_path == main_rel_str:
                                 existing = g
                                 break
                         
@@ -232,11 +256,22 @@ class GameLibraryManager:
                             game = Game(
                                 title=title,
                                 platforms=[plat],
-                                launch_path=rel_str
+                                launch_path=main_rel_str
                             )
                             found_games.append(game)
-                    
-                    elif item.is_dir():
+                        
+                        # Add all other executables in the same directory to exceptions
+                        for exe_item, exe_rel_str in exe_list:
+                            if exe_rel_str != main_rel_str:
+                                new_exceptions.append(exe_rel_str)
+                
+                # Continue recursing into subdirectories
+                for item in Path(path).iterdir():
+                    if item.name.startswith('.'):
+                        continue
+                    if item.is_symlink():
+                        continue
+                    if item.is_dir():
                         scan_recursive(item, depth + 1)
             
             except PermissionError:
