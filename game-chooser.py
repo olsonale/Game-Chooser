@@ -12,6 +12,7 @@ import sys
 import subprocess
 import platform
 import webbrowser
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
@@ -51,6 +52,103 @@ class Game:
             launch_path=data.get("launch_path", ""),
             library_name=data.get("library_name", "")
         )
+
+class ScanProgressDialog(wx.Dialog):
+    """Dialog showing scanning progress with cancel button"""
+    
+    def __init__(self, parent):
+        super().__init__(parent, title="Scanning for Games", 
+                        style=wx.CAPTION | wx.SYSTEM_MENU)
+        
+        self.cancelled = False
+        self.current_library = ""
+        self.libraries_processed = 0
+        self.total_libraries = 0
+        self.games_found = 0
+        
+        self.init_ui()
+        self.CenterOnParent()
+        
+    def init_ui(self):
+        """Initialize the dialog UI"""
+        panel = wx.Panel(self)
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Status text
+        self.status_text = wx.StaticText(panel, label="Initializing scan...")
+        main_sizer.Add(self.status_text, 0, wx.ALL | wx.EXPAND, 10)
+        
+        # Current library text
+        self.library_text = wx.StaticText(panel, label="")
+        main_sizer.Add(self.library_text, 0, wx.LEFT | wx.RIGHT | wx.EXPAND, 10)
+        
+        # Progress bar
+        self.progress_bar = wx.Gauge(panel, range=100)
+        main_sizer.Add(self.progress_bar, 0, wx.ALL | wx.EXPAND, 10)
+        
+        # Games found counter
+        self.games_text = wx.StaticText(panel, label="Games found: 0")
+        main_sizer.Add(self.games_text, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 10)
+        
+        # Cancel button
+        cancel_btn = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+        cancel_btn.Bind(wx.EVT_BUTTON, self.on_cancel)
+        main_sizer.Add(cancel_btn, 0, wx.ALIGN_CENTER | wx.ALL, 10)
+        
+        panel.SetSizer(main_sizer)
+        
+        # Size the dialog
+        main_sizer.Fit(panel)
+        self.SetClientSize(panel.GetSize())
+        self.SetMinSize((300, -1))
+        
+    def on_cancel(self, event):
+        """Handle cancel button click"""
+        self.cancelled = True
+        self.status_text.SetLabel("Cancelling scan...")
+        
+    def update_progress(self, library_name, progress, games_found):
+        """Update the progress display"""
+        if self.cancelled:
+            return
+            
+        # Use CallAfter to ensure UI updates happen on main thread
+        wx.CallAfter(self._update_progress_ui, library_name, progress, games_found)
+    
+    def _update_progress_ui(self, library_name, progress, games_found):
+        """Update progress UI on main thread"""
+        if library_name != self.current_library:
+            self.current_library = library_name
+            self.library_text.SetLabel(f"Scanning: {library_name}")
+            
+        self.progress_bar.SetValue(int(progress))
+        self.games_found = games_found
+        self.games_text.SetLabel(f"Games found: {games_found}")
+        
+    def set_library_count(self, total):
+        """Set total number of libraries to process"""
+        self.total_libraries = total
+        if total > 0:
+            self.status_text.SetLabel(f"Scanning {total} game libraries...")
+    
+    def finish_scan(self, games_found, exceptions_added):
+        """Called when scan is complete"""
+        wx.CallAfter(self._finish_scan_ui, games_found, exceptions_added)
+        
+    def _finish_scan_ui(self, games_found, exceptions_added):
+        """Finish scan UI on main thread"""
+        if self.cancelled:
+            self.status_text.SetLabel("Scan cancelled")
+        else:
+            self.status_text.SetLabel(f"Scan complete! Found {games_found} games")
+            if exceptions_added > 0:
+                self.games_text.SetLabel(f"Games found: {games_found} (+{exceptions_added} exceptions added)")
+        
+        self.progress_bar.SetValue(100)
+        
+        # Auto-close after 1 second if not cancelled
+        if not self.cancelled:
+            wx.CallLater(1000, self.EndModal, wx.ID_OK)
 
 class GameLibraryManager:
     """Handles all game library operations and data management"""
@@ -189,20 +287,51 @@ class GameLibraryManager:
         valid_names = ["game", "launch", "play", parent_name]
         return name in valid_names
     
-    def scan_library(self, library_path, library_name, max_depth=10):
+    def scan_library(self, library_path, library_name, max_depth=10, progress_callback=None, cancel_check=None):
         """Recursively scan a library path for games"""
         found_games = []
         new_exceptions = []
+        directories_to_scan = []
+        
+        # First pass: collect all directories to get total count for progress
+        if progress_callback:
+            def collect_directories(path, depth=0):
+                if depth > max_depth or (cancel_check and cancel_check()):
+                    return
+                try:
+                    for item in Path(path).iterdir():
+                        if item.name.startswith('.') or item.is_symlink():
+                            continue
+                        if item.is_dir():
+                            directories_to_scan.append(str(item))
+                            collect_directories(item, depth + 1)
+                except (PermissionError, OSError):
+                    pass
+            collect_directories(library_path)
+        
+        directories_processed = 0
         
         def scan_recursive(path, depth=0):
-            if depth > max_depth:
+            nonlocal directories_processed
+            
+            if depth > max_depth or (cancel_check and cancel_check()):
                 return
+            
+            # Update progress
+            if progress_callback and directories_to_scan:
+                progress = (directories_processed / len(directories_to_scan)) * 100
+                progress_callback(library_name, progress, len(found_games))
+                directories_processed += 1
             
             try:
                 # First, collect all executables in each directory to handle duplicates
                 directory_exes = {}
                 
                 for item in Path(path).iterdir():
+                    # Check for cancellation
+                    if cancel_check and cancel_check():
+                        return
+                        
                     # Skip hidden/system files and symlinks
                     if item.name.startswith('.'):
                         continue
@@ -226,6 +355,10 @@ class GameLibraryManager:
                 
                 # Process each directory's executables
                 for dir_path, exe_list in directory_exes.items():
+                    # Check for cancellation
+                    if cancel_check and cancel_check():
+                        return
+                        
                     if not exe_list:
                         continue
                     
@@ -275,6 +408,10 @@ class GameLibraryManager:
                 
                 # Continue recursing into subdirectories
                 for item in Path(path).iterdir():
+                    # Check for cancellation
+                    if cancel_check and cancel_check():
+                        return
+                        
                     if item.name.startswith('.'):
                         continue
                     if item.is_symlink():
@@ -289,13 +426,16 @@ class GameLibraryManager:
         scan_recursive(library_path)
         return found_games, new_exceptions
     
-    def validate_and_scan_all(self):
+    def validate_and_scan_all(self, progress_callback=None, cancel_check=None):
         """Validate existing games and scan for new ones"""
         validated_games = []
         all_new_exceptions = []
         
         # First, validate existing games
         for game in self.games:
+            if cancel_check and cancel_check():
+                return 0  # Return early if cancelled
+                
             if game.launch_path.startswith("http"):
                 validated_games.append(game)
                 continue
@@ -311,11 +451,14 @@ class GameLibraryManager:
         
         # Then scan all libraries for new games (exclude manual library)
         for lib in self.config["libraries"]:
+            if cancel_check and cancel_check():
+                return 0  # Return early if cancelled
+                
             if lib["name"] == "manual":
                 continue  # Skip manual library from autodiscovery
             try:
                 new_games, new_exceptions = self.scan_library(
-                    lib["path"], lib["name"]
+                    lib["path"], lib["name"], progress_callback=progress_callback, cancel_check=cancel_check
                 )
                 
                 # Add new exceptions
@@ -326,6 +469,9 @@ class GameLibraryManager:
                 
                 # Merge new games
                 for new_game in new_games:
+                    if cancel_check and cancel_check():
+                        return 0  # Return early if cancelled
+                        
                     existing = None
                     for val_game in validated_games:
                         if val_game.launch_path == new_game.launch_path:
@@ -349,6 +495,62 @@ class GameLibraryManager:
         self.save_config()
         
         return len(all_new_exceptions)
+    
+    def validate_and_scan_all_with_dialog(self, parent_window):
+        """Validate and scan all libraries with progress dialog"""
+        # Count libraries excluding manual
+        library_count = sum(1 for lib in self.config["libraries"] if lib["name"] != "manual")
+        
+        if library_count == 0:
+            return self.validate_and_scan_all()
+        
+        # Create and show progress dialog
+        progress_dialog = ScanProgressDialog(parent_window)
+        progress_dialog.set_library_count(library_count)
+        
+        # Variables to store results from background thread
+        scan_result = {"exceptions_count": 0, "error": None, "cancelled": False}
+        
+        def background_scan():
+            """Background thread function for scanning"""
+            try:
+                def progress_callback(library_name, progress, games_found):
+                    if not progress_dialog.cancelled:
+                        progress_dialog.update_progress(library_name, progress, games_found)
+                
+                def cancel_check():
+                    return progress_dialog.cancelled
+                
+                exceptions_count = self.validate_and_scan_all(progress_callback, cancel_check)
+                scan_result["exceptions_count"] = exceptions_count
+                scan_result["cancelled"] = progress_dialog.cancelled
+                
+            except Exception as e:
+                scan_result["error"] = e
+            finally:
+                # Signal completion
+                if not scan_result["cancelled"]:
+                    progress_dialog.finish_scan(len(self.games), scan_result["exceptions_count"])
+        
+        # Start background thread
+        thread = threading.Thread(target=background_scan, daemon=True)
+        thread.start()
+        
+        # Show dialog modally
+        result = progress_dialog.ShowModal()
+        progress_dialog.Destroy()
+        
+        # Wait for thread to finish if still running
+        thread.join(timeout=1.0)
+        
+        # Handle results
+        if scan_result["error"]:
+            raise scan_result["error"]
+        
+        if scan_result["cancelled"]:
+            return 0
+            
+        return scan_result["exceptions_count"]
 
 class EditManualGameDialog(wx.Dialog):
     """Dialog for editing manual game information"""
@@ -772,7 +974,7 @@ class PreferencesDialog(wx.Dialog):
         if libs_changed:
             # Rescan libraries
             try:
-                exc_count = self.library_manager.validate_and_scan_all()
+                exc_count = self.library_manager.validate_and_scan_all_with_dialog(self.GetParent())
                 if exc_count > 0:
                     if wx.MessageBox(f"Added {exc_count} executables to exceptions. Open preferences?",
                                     "Exceptions Added", 
@@ -1049,17 +1251,19 @@ class MainFrame(wx.Frame):
         accel_entries = []
         
         # Ctrl+F for search
-        accel_entries.append((wx.ACCEL_CTRL, ord('F'), wx.NewId()))
-        self.Bind(wx.EVT_MENU, lambda e: self.search_combo.SetFocus(), 
-                 id=accel_entries[-1][2])
+        search_id = wx.NewIdRef()
+        accel_entries.append((wx.ACCEL_CTRL, ord('F'), search_id))
+        self.Bind(wx.EVT_MENU, lambda e: self.search_combo.SetFocus(), id=search_id)
         
         # Ctrl+N for new web game
-        accel_entries.append((wx.ACCEL_CTRL, ord('N'), wx.NewId()))
-        self.Bind(wx.EVT_MENU, self.on_add_web_game, id=accel_entries[-1][2])
+        new_game_id = wx.NewIdRef()
+        accel_entries.append((wx.ACCEL_CTRL, ord('N'), new_game_id))
+        self.Bind(wx.EVT_MENU, self.on_add_web_game, id=new_game_id)
         
         # F5 for refresh
-        accel_entries.append((wx.ACCEL_NORMAL, wx.WXK_F5, wx.NewId()))
-        self.Bind(wx.EVT_MENU, self.on_refresh, id=accel_entries[-1][2])
+        refresh_id = wx.NewIdRef()
+        accel_entries.append((wx.ACCEL_NORMAL, wx.WXK_F5, refresh_id))
+        self.Bind(wx.EVT_MENU, self.on_refresh, id=refresh_id)
         
         accel_table = wx.AcceleratorTable(accel_entries)
         self.SetAcceleratorTable(accel_table)
@@ -1087,7 +1291,7 @@ class MainFrame(wx.Frame):
         
         # Validate and scan
         try:
-            exc_count = self.library_manager.validate_and_scan_all()
+            exc_count = self.library_manager.validate_and_scan_all_with_dialog(self)
             
             if len(self.library_manager.games) == 0:
                 if wx.MessageBox("No games found in currently added libraries. Open preferences?",
@@ -1514,7 +1718,7 @@ class MainFrame(wx.Frame):
     def on_refresh(self, event):
         """Refresh/rescan libraries"""
         try:
-            exc_count = self.library_manager.validate_and_scan_all()
+            exc_count = self.library_manager.validate_and_scan_all_with_dialog(self)
             self.refresh_game_list()
             self.build_tree()
             
