@@ -20,13 +20,14 @@ import stat
 class Game:
     """Represents a game in the library"""
     def __init__(self, title="", genre="", developer="", year="unknown", 
-                 platforms=None, launch_path=""):
+                 platforms=None, launch_path="", library_name=""):
         self.title = title
         self.genre = genre
         self.developer = developer
         self.year = year
         self.platforms = platforms or []
         self.launch_path = launch_path
+        self.library_name = library_name
     
     def to_dict(self):
         return {
@@ -35,7 +36,8 @@ class Game:
             "developer": self.developer,
             "year": self.year,
             "platforms": self.platforms,
-            "launch_path": self.launch_path
+            "launch_path": self.launch_path,
+            "library_name": self.library_name
         }
     
     @classmethod
@@ -46,7 +48,8 @@ class Game:
             developer=data.get("developer", ""),
             year=data.get("year", "unknown"),
             platforms=data.get("platforms", []),
-            launch_path=data.get("launch_path", "")
+            launch_path=data.get("launch_path", ""),
+            library_name=data.get("library_name", "")
         )
 
 class GameLibraryManager:
@@ -144,6 +147,10 @@ class GameLibraryManager:
     def get_full_path(self, game):
         """Construct full path from relative path and library"""
         if game.launch_path.startswith("http"):
+            return game.launch_path
+        
+        # Handle manual games - return the direct path
+        if game.library_name == "manual":
             return game.launch_path
         
         parts = Path(game.launch_path).parts
@@ -256,7 +263,8 @@ class GameLibraryManager:
                             game = Game(
                                 title=title,
                                 platforms=[plat],
-                                launch_path=main_rel_str
+                                launch_path=main_rel_str,
+                                library_name=library_name
                             )
                             found_games.append(game)
                         
@@ -292,12 +300,19 @@ class GameLibraryManager:
                 validated_games.append(game)
                 continue
             
+            # Always keep manual games (they manage their own paths)
+            if game.library_name == "manual":
+                validated_games.append(game)
+                continue
+            
             full_path = self.get_full_path(game)
             if full_path and Path(full_path).exists():
                 validated_games.append(game)
         
-        # Then scan all libraries for new games
+        # Then scan all libraries for new games (exclude manual library)
         for lib in self.config["libraries"]:
+            if lib["name"] == "manual":
+                continue  # Skip manual library from autodiscovery
             try:
                 new_games, new_exceptions = self.scan_library(
                     lib["path"], lib["name"]
@@ -334,6 +349,130 @@ class GameLibraryManager:
         self.save_config()
         
         return len(all_new_exceptions)
+
+class EditManualGameDialog(wx.Dialog):
+    """Dialog for editing manual game information"""
+    
+    def __init__(self, parent, game, library_manager):
+        super().__init__(parent, title="Add Manual Game", size=(400, 350))
+        
+        self.game = game
+        self.library_manager = library_manager
+        
+        # Get existing genres and developers for combo boxes
+        genres = sorted(set(g.genre for g in library_manager.games if g.genre))
+        developers = sorted(set(g.developer for g in library_manager.games if g.developer))
+        
+        panel = wx.Panel(self)
+        sizer = wx.GridBagSizer(5, 5)
+        
+        # Title
+        sizer.Add(wx.StaticText(panel, label="Title:"), 
+                 pos=(0, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        self.title_ctrl = wx.TextCtrl(panel, value=game.title)
+        sizer.Add(self.title_ctrl, pos=(0, 1), flag=wx.EXPAND)
+        
+        # Launch Path
+        sizer.Add(wx.StaticText(panel, label="Launch Path:"), 
+                 pos=(1, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        
+        path_panel = wx.Panel(panel)
+        path_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        
+        self.path_ctrl = wx.TextCtrl(path_panel, value="")
+        browse_btn = wx.Button(path_panel, label="Browse...")
+        browse_btn.Bind(wx.EVT_BUTTON, self.on_browse)
+        
+        path_sizer.Add(self.path_ctrl, 1, wx.EXPAND | wx.RIGHT, 5)
+        path_sizer.Add(browse_btn, 0)
+        path_panel.SetSizer(path_sizer)
+        
+        sizer.Add(path_panel, pos=(1, 1), flag=wx.EXPAND)
+        
+        # Platform
+        sizer.Add(wx.StaticText(panel, label="Platform:"), 
+                 pos=(2, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        platforms = ["Windows", "macOS", "Linux"]
+        self.platform_ctrl = wx.ComboBox(panel, choices=platforms, style=wx.CB_DROPDOWN)
+        if game.platforms:
+            self.platform_ctrl.SetValue(game.platforms[0])
+        else:
+            system = platform.system()
+            default_plat = "Windows" if system == "Windows" else "macOS"
+            self.platform_ctrl.SetValue(default_plat)
+        sizer.Add(self.platform_ctrl, pos=(2, 1), flag=wx.EXPAND)
+        
+        # Genre
+        sizer.Add(wx.StaticText(panel, label="Genre:"), 
+                 pos=(3, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        self.genre_ctrl = wx.ComboBox(panel, value=game.genre, choices=genres)
+        sizer.Add(self.genre_ctrl, pos=(3, 1), flag=wx.EXPAND)
+        
+        # Developer
+        sizer.Add(wx.StaticText(panel, label="Developer:"), 
+                 pos=(4, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        self.developer_ctrl = wx.ComboBox(panel, value=game.developer, 
+                                         choices=developers)
+        sizer.Add(self.developer_ctrl, pos=(4, 1), flag=wx.EXPAND)
+        
+        # Year
+        sizer.Add(wx.StaticText(panel, label="Year:"), 
+                 pos=(5, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        year_val = 2000 if game.year == "unknown" else int(game.year)
+        self.year_ctrl = wx.SpinCtrl(panel, value=str(year_val), 
+                                    min=1000, max=9999, initial=year_val)
+        sizer.Add(self.year_ctrl, pos=(5, 1), flag=wx.EXPAND)
+        
+        # Buttons
+        btn_sizer = wx.StdDialogButtonSizer()
+        ok_btn = wx.Button(panel, wx.ID_OK, "Add")
+        cancel_btn = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+        btn_sizer.AddButton(ok_btn)
+        btn_sizer.AddButton(cancel_btn)
+        btn_sizer.Realize()
+        
+        sizer.Add(btn_sizer, pos=(6, 0), span=(1, 2), 
+                 flag=wx.ALIGN_CENTER | wx.TOP, border=10)
+        
+        sizer.AddGrowableCol(1)
+        panel.SetSizer(sizer)
+        
+        # Validation
+        ok_btn.Bind(wx.EVT_BUTTON, self.on_ok)
+    
+    def on_browse(self, event):
+        """Browse for executable file"""
+        dlg = wx.FileDialog(self, "Select Game Executable", 
+                           wildcard="Executable files (*.exe)|*.exe|All files (*.*)|*.*")
+        if dlg.ShowModal() == wx.ID_OK:
+            self.path_ctrl.SetValue(dlg.GetPath())
+        dlg.Destroy()
+    
+    def on_ok(self, event):
+        """Validate and save changes"""
+        if not self.title_ctrl.GetValue().strip():
+            wx.MessageBox("Title is required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        
+        if not self.path_ctrl.GetValue().strip():
+            wx.MessageBox("Launch path is required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        
+        if not self.platform_ctrl.GetValue().strip():
+            wx.MessageBox("Platform is required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        
+        self.game.title = self.title_ctrl.GetValue().strip()
+        self.game.launch_path = self.path_ctrl.GetValue().strip()
+        self.game.platforms = [self.platform_ctrl.GetValue().strip()]
+        self.game.genre = self.genre_ctrl.GetValue().strip()
+        self.game.developer = self.developer_ctrl.GetValue().strip()
+        self.game.library_name = "manual"
+        
+        year_val = self.year_ctrl.GetValue()
+        self.game.year = str(year_val) if year_val != 2000 else "unknown"
+        
+        self.EndModal(wx.ID_OK)
 
 class EditGameDialog(wx.Dialog):
     """Dialog for editing game information"""
@@ -1186,6 +1325,9 @@ class MainFrame(wx.Frame):
         add_web_item = menu.Append(wx.ID_ANY, "Add Web Game")
         self.Bind(wx.EVT_MENU, self.on_add_web_game, add_web_item)
         
+        add_manual_item = menu.Append(wx.ID_ANY, "Add Manual Game")
+        self.Bind(wx.EVT_MENU, self.on_add_manual_game, add_manual_item)
+        
         self.PopupMenu(menu)
         menu.Destroy()
     
@@ -1264,8 +1406,19 @@ class MainFrame(wx.Frame):
         if not game:
             return
         
-        is_web = game.launch_path.startswith("http")
-        dlg = EditGameDialog(self, game, self.library_manager, is_web)
+        if game.launch_path.startswith("http"):
+            # Web game
+            dlg = EditGameDialog(self, game, self.library_manager, is_web=True)
+        elif game.library_name == "manual":
+            # Manual game - use manual edit dialog
+            dlg = EditManualGameDialog(self, game, self.library_manager)
+            dlg.SetTitle("Edit Manual Game")
+            # Pre-populate the path field with the full path
+            dlg.path_ctrl.SetValue(game.launch_path)
+        else:
+            # Regular auto-discovered game
+            dlg = EditGameDialog(self, game, self.library_manager, is_web=False)
+        
         if dlg.ShowModal() == wx.ID_OK:
             self.library_manager.save_games()
             self.refresh_game_list()
@@ -1288,6 +1441,17 @@ class MainFrame(wx.Frame):
         """Add a new web game"""
         game = Game(title="", platforms=["Web"], launch_path="https://")
         dlg = EditGameDialog(self, game, self.library_manager, is_web=True)
+        
+        if dlg.ShowModal() == wx.ID_OK:
+            self.library_manager.games.append(game)
+            self.library_manager.save_games()
+            self.refresh_game_list()
+        dlg.Destroy()
+    
+    def on_add_manual_game(self, event):
+        """Add a new manual game"""
+        game = Game(title="", platforms=[], launch_path="")
+        dlg = EditManualGameDialog(self, game, self.library_manager)
         
         if dlg.ShowModal() == wx.ID_OK:
             self.library_manager.games.append(game)
